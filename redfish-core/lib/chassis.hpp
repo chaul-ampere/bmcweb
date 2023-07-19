@@ -19,6 +19,7 @@
 
 #include "app.hpp"
 #include "dbus_utility.hpp"
+#include "generated/enums/chassis.hpp"
 #include "health.hpp"
 #include "led.hpp"
 #include "query.hpp"
@@ -35,11 +36,122 @@
 #include <sdbusplus/unpack_properties.hpp>
 
 #include <array>
+#include <memory>
 #include <ranges>
+#include <string>
 #include <string_view>
 
 namespace redfish
 {
+/**
+ * @brief Convert chassis intrusion sensor status string on DBus to Redfish
+ *
+ * @param[in] status - Status property string on DBus.
+ *
+ * @return An optional of chassis::IntrusionSensor enum.
+ */
+inline std::optional<chassis::IntrusionSensor>
+    dbusChassisIntrusionStatusToRf(std::string_view status)
+{
+    if (status == "xyz.openbmc_project.Chassis.Intrusion.Status.Normal")
+    {
+        return chassis::IntrusionSensor::Normal;
+    }
+    if (status ==
+        "xyz.openbmc_project.Chassis.Intrusion.Status.HardwareIntrusion")
+    {
+        return chassis::IntrusionSensor::HardwareIntrusion;
+    }
+    if (status ==
+        "xyz.openbmc_project.Chassis.Intrusion.Status.TamperingDetected")
+    {
+        return chassis::IntrusionSensor::TamperingDetected;
+    }
+    if (status == "xyz.openbmc_project.Chassis.Intrusion.Status.Unknown")
+    {
+        return std::nullopt;
+    }
+    return chassis::IntrusionSensor::Invalid;
+}
+
+/**
+ * @brief Convert chassis intrusion sensor rearm mode string on DBus to Redfish
+ *
+ * @param[in] rearmMode - Rearm property string on DBus.
+ *
+ * @return A value of chassis::IntrusionSensorReArm enum.
+ */
+inline chassis::IntrusionSensorReArm dbusChassisIntrusionRearmModeToRf(std::string_view rearmMode)
+{
+    if (rearmMode == "xyz.openbmc_project.Chassis.Intrusion.RearmMode.Manual")
+    {
+        return chassis::IntrusionSensorReArm::Manual;
+    }
+    if (rearmMode ==
+        "xyz.openbmc_project.Chassis.Intrusion.RearmMode.Automatic")
+    {
+        return chassis::IntrusionSensorReArm::Automatic;
+    }
+    return chassis::IntrusionSensorReArm::Invalid;
+}
+
+/**
+ * @brief Fill PhysicalSecurity's data
+ *
+ * @param[in] resp - HTTP response.
+* @param[in] ec - errore code from getAllProperties.
+ * @param[in] propertiesMap - The property map under
+ *            "xyz.openbmc_project.Chassis.Intrusion" interface.
+ *
+ * @return None.
+ */
+inline void handlePhysicalSecurityProperties(
+    crow::Response& resp, const dbus::utility::DBusPropertiesMap& propertiesMap)
+{
+    std::string status;
+    std::string rearmMode;
+
+    const bool success = sdbusplus::unpackPropertiesNoThrow(
+        dbus_utils::UnpackErrorPrinter(), propertiesMap, "Status", status,
+        "Rearm", rearmMode);
+
+    if (!success)
+    {
+        messages::internalError(resp);
+        return;
+    }
+
+    std::optional<chassis::IntrusionSensor> intrusionSensor =
+        dbusChassisIntrusionStatusToRf(status);
+
+    if (!intrusionSensor)
+    {
+        BMCWEB_LOG_WARNING("Unknown ChassisIntrusionStatus: {}", status);
+    }
+    else
+    {
+        if (*intrusionSensor == chassis::IntrusionSensor::Invalid)
+        {
+            BMCWEB_LOG_ERROR("Invalid ChassisIntrusionStatus: {}", status);
+            messages::internalError(resp);
+            return;
+        }
+        resp.jsonValue["PhysicalSecurity"]["IntrusionSensor"] =
+            *intrusionSensor;
+    }
+
+    chassis::IntrusionSensorReArm intrusionSensorReArm =
+        dbusChassisIntrusionRearmModeToRf(rearmMode);
+
+    if (intrusionSensorReArm == chassis::IntrusionSensorReArm::Invalid)
+    {
+        BMCWEB_LOG_ERROR("Invalid ChassisIntrusionRearmMode: {}", rearmMode);
+        messages::internalError(resp);
+        return;
+    }
+    resp.jsonValue["PhysicalSecurity"]["IntrusionSensorReArm"] =
+        intrusionSensorReArm;
+}
 
 /**
  * @brief Retrieves resources over dbus to link to the chassis
@@ -143,42 +255,48 @@ inline void
         const boost::system::error_code& ec,
         const dbus::utility::MapperGetSubTreeResponse& subtree)
 {
-    if (ec)
+    if (ec || subtree.empty())
     {
         // do not add err msg in redfish response, because this is not
         //     mandatory property
-        BMCWEB_LOG_INFO("DBUS error: no matched iface {}", ec);
+        BMCWEB_LOG_INFO("DBUS error: no matched iface");
         return;
     }
-    // Iterate over all retrieved ObjectPaths.
-    for (const auto& object : subtree)
+
+    // There should be only one place implementing this interface
+    if (subtree.size() > 1)
     {
-        if (!object.second.empty())
-        {
-            const auto service = object.second.front();
-
-            BMCWEB_LOG_DEBUG("Get intrusion status by service ");
-
-            sdbusplus::asio::getProperty<std::string>(
-                *crow::connections::systemBus, service, objPath,
-                "xyz.openbmc_project.Chassis.Intrusion", "Status",
-                [asyncResp{std::move(asyncResp)}](const boost::system::error_code& ec1,
-                                                const std::string& value) {
-                if (ec1)
-                {
-                    // do not add err msg in redfish response, because this is not
-                    //     mandatory property
-                    BMCWEB_LOG_ERROR("DBUS response error {}", ec1);
-                    return;
-                }
-                asyncResp->res.jsonValue["PhysicalSecurity"]["IntrusionSensorNumber"] =
-                    1;
-                asyncResp->res.jsonValue["PhysicalSecurity"]["IntrusionSensor"] = value;
-                });
-
-            return;
-        }
+        BMCWEB_LOG_ERROR("Found more than one Chassis Intrusion DBus object");
+        messages::internalError(asyncResp->res);
+        return;
     }
+
+    const auto& [objPath, serviceMap] = subtree[0];
+
+    if (serviceMap.empty())
+    {
+        BMCWEB_LOG_ERROR("Error getting service map of Chassis Intrusion object");
+        messages::internalError(asyncResp->res);
+        return;
+    }
+
+    const std::string& service = serviceMap.front().first;
+
+    sdbusplus::asio::getAllProperties(
+        *crow::connections::systemBus, service, objPath,
+        "xyz.openbmc_project.Chassis.Intrusion",
+        [asyncResp](const boost::system::error_code& ec1,
+                const dbus::utility::DBusPropertiesMap& propertiesMap) {
+            if (ec1)
+            {
+                if (ec1.value() != EBADR)
+                {
+                    BMCWEB_LOG_WARNING("DBUS response error for Properties{}", ec1);
+                }
+                return;
+            }
+            handlePhysicalSecurityProperties(asyncResp->res, propertiesMap);
+        });
 }
 
 inline void handleChassisCollectionGet(
@@ -657,6 +775,51 @@ inline void
     });
 }
 
+inline void setIntrusionSensorByService(
+    const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
+    const std::string& intrusionSensor, const boost::system::error_code& ec,
+    const dbus::utility::MapperGetSubTreeResponse& subtree)
+{
+    if (ec || subtree.empty())
+    {
+        BMCWEB_LOG_ERROR("DBUS error: no matched iface");
+        messages::internalError(asyncResp->res);
+        return;
+    }
+
+    // There should be only one place implementing this interface
+    if (subtree.size() > 1)
+    {
+        BMCWEB_LOG_ERROR("Found more than one Chassis Intrusion DBus object");
+        messages::internalError(asyncResp->res);
+        return;
+    }
+
+    const auto& [objPath, serviceMap] = subtree[0];
+
+    if (serviceMap.empty())
+    {
+        BMCWEB_LOG_ERROR("Error getting service map of Chassis Intrusion object");
+        messages::internalError(asyncResp->res);
+        return;
+    }
+
+    const std::string& service = serviceMap.front().first;
+
+    sdbusplus::asio::setProperty(
+        *crow::connections::systemBus, service, objPath,
+        "xyz.openbmc_project.Chassis.Intrusion", "Status", intrusionSensor,
+        [asyncResp](const boost::system::error_code& ec1) {
+        if (ec1)
+        {
+            BMCWEB_LOG_ERROR("DBUS error: failed to set property");
+            messages::internalError(asyncResp->res);
+            return;
+        }
+        messages::success(asyncResp->res);
+        });
+}
+
 inline void
     handleChassisPatch(App& app, const crow::Request& req,
                        const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
@@ -668,6 +831,7 @@ inline void
     }
     std::optional<bool> locationIndicatorActive;
     std::optional<std::string> indicatorLed;
+    std::optional<std::string> intrusionSensor;
 
     if (param.empty())
     {
@@ -676,9 +840,31 @@ inline void
 
     if (!json_util::readJsonPatch(
             req, asyncResp->res, "LocationIndicatorActive",
-            locationIndicatorActive, "IndicatorLED", indicatorLed))
+            locationIndicatorActive, "IndicatorLED", indicatorLed,
+            "PhysicalSecurity/IntrusionSensor", intrusionSensor))
     {
         return;
+    }
+
+    if (intrusionSensor)
+    {
+        if (*intrusionSensor != "Normal")
+        {
+            BMCWEB_LOG_ERROR(
+                "IntrusionSensor property only accepts Normal to reset the physical security state");
+            messages::propertyValueIncorrect(asyncResp->res, "IntrusionSensor",
+                                             *intrusionSensor);
+            return;
+        }
+        constexpr std::array<std::string_view, 1> interfaces = {
+            "xyz.openbmc_project.Chassis.Intrusion"};
+
+        const std::string normalStatusDbusStr =
+            "xyz.openbmc_project.Chassis.Intrusion.Status.Normal";
+
+        dbus::utility::getSubTree(
+            "/xyz/openbmc_project", 0, interfaces,
+            std::bind_front(setIntrusionSensorByService, asyncResp, normalStatusDbusStr));
     }
 
     // TODO (Gunnar): Remove IndicatorLED after enough time has passed
